@@ -24,6 +24,28 @@
  */
 package com.cloudbees.jenkins.plugins.bitbucket.client;
 
+import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.MINUTES;
+import static java.util.concurrent.TimeUnit.SECONDS;
+
+import java.io.ByteArrayOutputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UnsupportedEncodingException;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 import com.cloudbees.jenkins.plugins.bitbucket.JsonParser;
 import com.cloudbees.jenkins.plugins.bitbucket.api.BitbucketApi;
 import com.cloudbees.jenkins.plugins.bitbucket.api.BitbucketAuthenticator;
@@ -56,28 +78,7 @@ import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredenti
 import com.damnhandy.uri.template.UriTemplate;
 import com.damnhandy.uri.template.impl.Operator;
 import com.fasterxml.jackson.core.type.TypeReference;
-import edu.umd.cs.findbugs.annotations.CheckForNull;
-import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.ProxyConfiguration;
-import hudson.Util;
-import java.io.ByteArrayOutputStream;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.UnsupportedEncodingException;
-import java.net.InetSocketAddress;
-import java.net.Proxy;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.Callable;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import jenkins.model.Jenkins;
-import jenkins.scm.api.SCMFile;
+
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.http.HttpHost;
@@ -112,10 +113,12 @@ import org.apache.http.util.EntityUtils;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.ProtectedExternally;
 
-import static java.util.concurrent.TimeUnit.HOURS;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
-import static java.util.concurrent.TimeUnit.SECONDS;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
+import hudson.ProxyConfiguration;
+import hudson.Util;
+import jenkins.model.Jenkins;
+import jenkins.scm.api.SCMFile;
 
 public class BitbucketCloudApiClient implements BitbucketApi {
 
@@ -682,7 +685,7 @@ public class BitbucketCloudApiClient implements BitbucketApi {
 
         final UriTemplate template = UriTemplate.fromTemplate(V2_API_BASE_URL + "{/owner}{?role,page,pagelen}")
                 .set("owner", owner)
-                .set("pagelen", 50);
+                .set("pagelen", 100);
         if (role != null &&  authenticator != null) {
             template.set("role", role.getId());
             cacheKey.append("::").append(role.getId());
@@ -697,6 +700,8 @@ public class BitbucketCloudApiClient implements BitbucketApi {
                 try {
                     page = JsonParser.toJava(response, PaginatedBitbucketRepository.class);
                     repositories.addAll(page.getValues());
+                } catch (BitbucketRequestException e) {
+                    throw e;
                 } catch (IOException e) {
                     throw new IOException("I/O error when parsing response from URL: " + url, e);
                 }
@@ -711,6 +716,8 @@ public class BitbucketCloudApiClient implements BitbucketApi {
             } else {
                 return request.call();
             }
+        } catch (BitbucketRequestException e) {
+            throw e;
         } catch (Exception ex) {
             throw new IOException("Error while loading repositories from cache", ex);
         }
@@ -768,18 +775,11 @@ public class BitbucketCloudApiClient implements BitbucketApi {
         httpMethod.setConfig(requestConfig.build());
 
         CloseableHttpResponse response = client.execute(API_HOST, httpMethod, context);
-        while (response.getStatusLine().getStatusCode() == API_RATE_LIMIT_CODE) {
-            release(httpMethod);
-            if (Thread.interrupted()) {
-                throw new InterruptedException();
-            }
-            /*
-                TODO: When bitbucket starts supporting rate limit expiration time, remove 5 sec wait and put code
-                      to wait till expiration time is over. It should also fix the wait for ever loop.
-             */
-            LOGGER.fine("Bitbucket Cloud API rate limit reached, sleeping for 5 sec then retry...");
-            Thread.sleep(5000);
-            response = client.execute(API_HOST, httpMethod, context);
+
+        if (response.getStatusLine().getStatusCode() == API_RATE_LIMIT_CODE) {
+            int statusCode = response.getStatusLine().getStatusCode();
+            
+            throw new BitbucketRequestException(statusCode, "HTTP request error. Status: Rate limit reached, try again later.");
         }
         return response;
     }
